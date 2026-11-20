@@ -16,7 +16,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .errors import PlanError
-from .expr import parse_queries, predicate_columns, validate, validate_projection
+from .expr import predicate_columns, validate, validate_projection
+from .nested import (
+    MarkerQuery,
+    parse_query_item,
+    plan_marker_file,
+    read_nested_footer_stats,
+    reference_marker_scan,
+    scan_marker_query,
+    validate_marker,
+)
 from .planner import GroupDecision, plan_file
 from .reference import reference_scan
 from .scanner import InstrumentedParquetFile, PROVENANCE_COLUMNS, scan_query
@@ -28,13 +37,12 @@ def _load_json(path: str) -> Any:
         return json.load(fh)
 
 
-def _plan_to_dict(query_id: str, predicate: dict[str, Any],
+def _plan_to_dict(query_id: str, predicate: Any, rule: str,
                   decisions_by_file: dict[str, list[GroupDecision]]) -> dict[str, Any]:
     return {
         "query_id": query_id,
         "predicate": predicate,
-        "rule": "仅当能证明 can_be_true=False 时跳过；统计缺失/不可靠则保守保留；"
-                "NOT 同时翻转 can_be_true/can_be_false，UNKNOWN 不当 FALSE",
+        "rule": rule,
         "files": [
             {
                 "file": path,
@@ -57,11 +65,18 @@ def _plan_to_dict(query_id: str, predicate: dict[str, Any],
     }
 
 
+_FLAT_RULE = ("仅当能证明 can_be_true=False 时跳过；统计缺失/不可靠则保守保留；"
+              "NOT 同时翻转 can_be_true/can_be_false，UNKNOWN 不当 FALSE")
+_MARKER_RULE = ("存在条件：任一条件被自身读数叶列的 footer 统计证伪（单条件、不跨列拼极值）"
+                "则整组条件不可能为真，行组跳过；统计缺失/不可靠保守保留；"
+                "取反的存在条件无法仅凭 footer 证伪，全部保留")
+
+
 def run(files_json: str, queries_json: str, out_dir: str) -> dict[str, Any]:
     fixture_dir = os.path.dirname(os.path.abspath(files_json))
     file_names = _load_json(files_json)
     files = [os.path.join(fixture_dir, name) for name in file_names]
-    queries = parse_queries(_load_json(queries_json))
+    queries = [parse_query_item(item) for item in _load_json(queries_json)]
 
     plans_dir = os.path.join(out_dir, "plans")
     results_dir = os.path.join(out_dir, "results")
@@ -72,7 +87,9 @@ def run(files_json: str, queries_json: str, out_dir: str) -> dict[str, Any]:
     # 执行阶段每条查询通过工厂拿到全新的读取器，请求按查询隔离、不跨查询累积。
     footer_pf = {path: pq.ParquetFile(path) for path in files}
     schemas = {path: pf.schema_arrow for path, pf in footer_pf.items()}
-    footer_stats = {path: read_footer_stats(path, schemas[path]) for path in files}
+    # 平面统计按文件惰性缓存（嵌套 schema 会在平面查询首次涉及时报错，行为与旧版一致）；
+    # 嵌套统计依赖具体查询的条件字段，按 (查询, 文件) 现取现用。
+    flat_stats: dict[str, Any] = {}
 
     run_record: dict[str, Any] = {
         "note": "记录工具实际发起的 read_row_group 列读取请求；非操作系统磁盘字节，"
@@ -83,28 +100,50 @@ def run(files_json: str, queries_json: str, out_dir: str) -> dict[str, Any]:
     verification: dict[str, Any] = {"queries": []}
 
     for query in queries:
-        for path in files:
-            validate(query.where, schemas[path])
-            validate_projection(query.columns, schemas[path])
-        filter_cols = sorted(predicate_columns(query.where))
-        if set(filter_cols) & set(PROVENANCE_COLUMNS):
-            raise PlanError(f"查询 {query.id} 引用了保留的溯源列名 {PROVENANCE_COLUMNS}")
+        if isinstance(query, MarkerQuery):
+            for path in files:
+                validate_marker(query, schemas[path])
+            decisions_by_file = {
+                path: plan_marker_file(
+                    path, query, read_nested_footer_stats(path, schemas[path], query)
+                )
+                for path in files
+            }
+            plan_doc = _plan_to_dict(query.id, query.raw, _MARKER_RULE, decisions_by_file)
+            with open(os.path.join(plans_dir, f"{query.id}.json"), "w", encoding="utf-8") as fh:
+                json.dump(plan_doc, fh, ensure_ascii=False, indent=2)
 
-        # ---- 计划阶段：只用 footer 统计 ------------------------------------
-        decisions_by_file = {
-            path: plan_file(path, query.where, footer_stats[path]) for path in files
-        }
-        plan_doc = _plan_to_dict(query.id, query.where, decisions_by_file)
-        with open(os.path.join(plans_dir, f"{query.id}.json"), "w", encoding="utf-8") as fh:
-            json.dump(plan_doc, fh, ensure_ascii=False, indent=2)
+            output_path = os.path.join(results_dir, f"{query.id}.parquet")
+            query_run = scan_marker_query(query, decisions_by_file, InstrumentedParquetFile, output_path)
+            run_record["queries"].append(query_run.to_dict())
 
-        # ---- 执行阶段：真实列读取在 scan_query 内发生并登记 -----------------
-        output_path = os.path.join(results_dir, f"{query.id}.parquet")
-        query_run = scan_query(query, decisions_by_file, InstrumentedParquetFile, output_path)
-        run_record["queries"].append(query_run.to_dict())
+            ref_table = reference_marker_scan(query, files)
+        else:
+            for path in files:
+                validate(query.where, schemas[path])
+                validate_projection(query.columns, schemas[path])
+            filter_cols = sorted(predicate_columns(query.where))
+            if set(filter_cols) & set(PROVENANCE_COLUMNS):
+                raise PlanError(f"查询 {query.id} 引用了保留的溯源列名 {PROVENANCE_COLUMNS}")
 
-        # ---- 独立核对：无剪枝全扫描（纯 Python 3VL）------------------------
-        ref_table = reference_scan(query, files)
+            for path in files:
+                if path not in flat_stats:
+                    flat_stats[path] = read_footer_stats(path, schemas[path])
+            decisions_by_file = {
+                path: plan_file(path, query.where, flat_stats[path]) for path in files
+            }
+            plan_doc = _plan_to_dict(query.id, query.where, _FLAT_RULE, decisions_by_file)
+            with open(os.path.join(plans_dir, f"{query.id}.json"), "w", encoding="utf-8") as fh:
+                json.dump(plan_doc, fh, ensure_ascii=False, indent=2)
+
+            # ---- 执行阶段：真实列读取在 scan_query 内发生并登记 -----------------
+            output_path = os.path.join(results_dir, f"{query.id}.parquet")
+            query_run = scan_query(query, decisions_by_file, InstrumentedParquetFile, output_path)
+            run_record["queries"].append(query_run.to_dict())
+
+            # ---- 独立核对：无剪枝全扫描（纯 Python 3VL）------------------------
+            ref_table = reference_scan(query, files)
+
         got_table = pq.read_table(output_path)
         ok, detail = _compare(got_table, ref_table)
         verification["queries"].append(

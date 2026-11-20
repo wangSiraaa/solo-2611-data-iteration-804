@@ -1,0 +1,16 @@
+{
+  "id": "batch-cn",
+  "contract": {
+    "steps": [
+      "C",
+      "N"
+    ],
+    "max_gaps": [
+      2
+    ]
+  },
+  "marker_files": [
+    "../../output/results/m_c.parquet",
+    "../../output/results/m_n.parquet"
+  ]
+}

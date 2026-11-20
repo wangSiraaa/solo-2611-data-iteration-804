@@ -1,0 +1,75 @@
+[
+  {
+    "id": "m_a",
+    "marker": "A",
+    "exists": [
+      {
+        "eq": [
+          "probe",
+          "P"
+        ]
+      },
+      {
+        "ge": [
+          "value",
+          8
+        ]
+      }
+    ]
+  },
+  {
+    "id": "m_b",
+    "marker": "B",
+    "exists": [
+      {
+        "eq": [
+          "probe",
+          "Q"
+        ]
+      },
+      {
+        "le": [
+          "value",
+          1
+        ]
+      }
+    ]
+  },
+  {
+    "id": "m_c",
+    "marker": "C",
+    "exists": [
+      {
+        "eq": [
+          "probe",
+          "R"
+        ]
+      },
+      {
+        "ge": [
+          "value",
+          100
+        ]
+      }
+    ]
+  },
+  {
+    "id": "m_n",
+    "marker": "N",
+    "negate": true,
+    "exists": [
+      {
+        "eq": [
+          "probe",
+          "R"
+        ]
+      },
+      {
+        "ge": [
+          "value",
+          100
+        ]
+      }
+    ]
+  }
+]

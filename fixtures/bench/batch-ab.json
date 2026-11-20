@@ -1,0 +1,16 @@
+{
+  "id": "batch-ab",
+  "contract": {
+    "steps": [
+      "A",
+      "B"
+    ],
+    "max_gaps": [
+      3
+    ]
+  },
+  "marker_files": [
+    "../../output/results/m_a.parquet",
+    "../../output/results/m_b.parquet"
+  ]
+}

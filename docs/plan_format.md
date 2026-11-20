@@ -108,3 +108,83 @@ footer 的 `total_compressed_size` 仅存在于 footer，不冒充实际 I/O。
   `_source_file`、`_source_row_group`、`_source_row_in_group`；
 - 行序：文件顺序（files.json）→ 行组物理索引 → 组内物理行号；
 - 跨文件的重复数据原样保留；空结果写出同 schema 的零行 Parquet。
+
+# 标记查询（嵌套探头读数）
+
+queries.json 中含 `"exists"` 键的对象按标记查询处理，与平面查询可混排：
+
+```json
+{
+  "id": "m_a",
+  "marker": "A",
+  "exists": [{"eq": ["probe", "P"]}, {"ge": ["value", 8]}],
+  "negate": false,
+  "record": {"device": "device", "ts": "ts", "sample_id": "sample_id", "readings": "readings"}
+}
+```
+
+- `exists`：非空条件列表，整组条件在同一个读数元素上合取；条件只支持
+  `eq/ne/lt/le/gt/ge`（`[字段名, 字面量]`）与 `is_null`（字段名），不嵌套逻辑运算；
+- `negate`：可选，默认 `false`；为 `true` 时对整个存在条件取反，仍只输出真；
+- `record`：可选的列名映射，默认如上；四个键缺一不可改、值不可重复。
+
+## 标记事实 Parquet（output/results/<id>.parquet）
+
+固定 schema（批处理按此契约读取）：
+
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `marker` | string | 标记名 |
+| `device` / `ts` / `sample_id` | 与源记录相同 | 命中采样的设备、整数时刻、唯一采样号 |
+| `hit_indices` | `list<int64>` | 全部真元素的原始下标；取反而命中时为空列表 |
+| `_source_file` / `_source_row_group` / `_source_row_in_group` | string / int32 / int64 | 物理出处 |
+
+行序与平面查询一致；空结果写出同 schema 的零行 Parquet。
+
+## 标记查询计划（output/plans/<id>.json）
+
+结构与平面计划相同（`files[].row_groups[]` 的 action/reason/trace），
+`trace` 根节点 `op` 为 `exists` 或 `not`，子节点是各条件的单列证伪轨迹：
+
+- 每个条件只用**自身读数叶列**（如 `readings.list.element.probe`）的 footer
+  min/max（`is_null` 用 `null_count=0`）判断“是否可能有元素满足”，只证伪不证实；
+- 任一条件被证伪 -> 整组条件不可能为真 -> `skip`；统计缺失/不可靠 ->
+  该条件保守为真并在 `missing_or_unreliable_stats` 登记；
+- 取反查询无法仅凭 footer 证明“不存在确定为假的行”，全部 `keep`，
+  trace 的 `unknown` 中登记该原因。
+
+# 台架程序批处理结算（output/settlement/）
+
+批描述 JSON（`--batch`）：
+
+```json
+{
+  "id": "batch-ab",
+  "contract": {"steps": ["A", "B"], "max_gaps": [3]},
+  "marker_files": ["../../output/results/m_a.parquet", "../../output/results/m_b.parquet"]
+}
+```
+
+- `steps`：1..4 个按顺序的标记名；`max_gaps`：相邻两步允许的最大时间差
+  （长度 = `steps` 数 - 1，非负整数，边界值可用）；
+- `marker_files` 相对批描述文件解析；`--markers` 可整体覆盖；每批固定一个合同。
+
+## settlement/<batch_id>.parquet
+
+每行是某选中程序的一步：
+
+| 列 | 含义 |
+| --- | --- |
+| `device` / `program_index` / `step_index` | 设备、程序序号（按首时刻升序）、步序号 |
+| `marker` / `ts` / `sample_id` / `hit_indices` | 该步的标记事实原文 |
+| `program_span` / `program_start_ts` / `program_end_ts` | 程序闭区间与跨度 |
+| `_source_file` / `_source_row_group` / `_source_row_in_group` | 该步事实的物理出处 |
+
+## settlement/<batch_id>.json
+
+人读报告：`contract`、`limits`（最多 4 步 / 每设备最多 60 采样）、
+`devices[]`（每台设备的标记事实数、候选程序数、选中程序数、总跨度，
+以及每段程序的区间与各步 `marker/ts/sample_id/hit_indices/source`）。
+
+挑选规则：每台设备上段数最多；并列先取总跨度较小；再按各段依次使用的
+采样号序列字典序定胜负。闭区间互不重叠（前段末时刻 < 后段首时刻）。
